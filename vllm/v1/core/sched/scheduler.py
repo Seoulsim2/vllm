@@ -47,6 +47,27 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+# SLO-Tuner imports:
+import logging
+from datetime import datetime
+logging.basicConfig(
+    filename="slo_tuner_debug.log",
+    level=logging.DEBUG,
+    format="%(message)s",
+    filemode="a",
+)
+
+def log_header_if_empty():
+    try:
+        with open("slo_tuner_debug.log", "r") as f:
+            if f.read().strip():
+                return
+    except FileNotFoundError:
+        pass
+    with open("slo_tuner_debug.log", "w") as f:
+        f.write("active_max_num_scheduled_tokens, active_max_num_running_reqs, active_num_spec_tokens\n")
+
+log_header_if_empty()
 
 
 class Scheduler(SchedulerInterface):
@@ -60,6 +81,10 @@ class Scheduler(SchedulerInterface):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
+        
+        # SLO-Tuner: Checking if this is even created
+        print(">>> USING MY CUSTOM SCHEDULER <<<")
+        
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
@@ -83,7 +108,7 @@ class Scheduler(SchedulerInterface):
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
-        self.max_model_len = vllm_config.model_config.max_model_len
+        self.max_model_len = self.scheduler_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -121,7 +146,6 @@ class Scheduler(SchedulerInterface):
 
         self.block_size = block_size
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
@@ -184,9 +208,16 @@ class Scheduler(SchedulerInterface):
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
-            pcp_world_size=self.pcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        # Runtime overrides (None means use configured values)
+        # These can be modified at runtime via the setter methods below.
+        self._runtime_max_num_running_reqs: int | None = None
+        self._runtime_max_num_scheduled_tokens: int | None = None
+        self._runtime_num_spec_tokens: int | None = None
+        self._runtime_num_lookahead_tokens: int | None = None
+        # Verifier cadence: verify every k tokens (None = use default / disabled)
+        self.verifier_cadence: int | None = None
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -200,6 +231,8 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        print(">>> USING MY CUSTOM SCHEDULER schedule() <<<")
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -207,7 +240,45 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        # Allow runtime overrides for batching/speculation. If a runtime
+        # override is set, use it for this scheduling step. Otherwise fall
+        # back to the configured values.
+        
+        # (token budget per scheduling step):
+        active_max_num_scheduled_tokens = (
+            self._runtime_max_num_scheduled_tokens
+            if self._runtime_max_num_scheduled_tokens is not None
+            else self.max_num_scheduled_tokens
+        )
+        # (max number of running requests (Batch size?)):
+        active_max_num_running_reqs = (
+            self._runtime_max_num_running_reqs
+            if self._runtime_max_num_running_reqs is not None
+            else self.max_num_running_reqs
+        )
+
+        # Draft width (speculative decoding):
+        active_num_spec_tokens = (
+            self._runtime_num_spec_tokens
+            if self._runtime_num_spec_tokens is not None
+            else self.num_spec_tokens
+        )
+
+        # TODO: Find where verifier cadence logic is located
+        # This isn't used
+        active_num_lookahead = (
+            self._runtime_num_lookahead_tokens
+            if self._runtime_num_lookahead_tokens is not None
+            else self.num_lookahead_tokens
+        )
+
+        # Apply speculation overrides for this scheduling step so other
+        # methods (e.g., kv cache allocation) that read these attributes
+        # will see the active values.
+        self.num_spec_tokens = active_num_spec_tokens
+        self.num_lookahead_tokens = active_num_lookahead
+
+        token_budget = active_max_num_scheduled_tokens
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -302,20 +373,6 @@ class Scheduler(SchedulerInterface):
                             ]
                             req_to_new_blocks.pop(preempted_req.request_id)
                             num_scheduled_tokens.pop(preempted_req.request_id)
-                            scheduled_spec_decode_tokens.pop(
-                                preempted_req.request_id, None
-                            )
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req.request_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_tokens_to_restore = sum(
-                                    preempted_req.get_num_encoder_tokens(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_tokens_to_restore
                             req_index -= 1
                     else:
                         preempted_req = self.running.pop()
@@ -350,10 +407,7 @@ class Scheduler(SchedulerInterface):
             # Speculative decode related.
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
-                    - request.num_output_placeholders
+                    num_new_tokens + request.num_computed_tokens - request.num_tokens
                 )
                 if num_scheduled_spec_tokens > 0:
                     # Trim spec_token_ids list to num_scheduled_spec_tokens.
@@ -362,7 +416,7 @@ class Scheduler(SchedulerInterface):
                         request.spec_token_ids
                     )
                 # New spec tokens will be set in `update_draft_token_ids` before the
-                # next step when applicable.
+                # next step when applicable.p
                 request.spec_token_ids = []
 
             # Encoder-related.
@@ -397,7 +451,7 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+                if len(self.running) == active_max_num_running_reqs:
                     break
 
                 request = self.waiting.peek_request()
@@ -474,9 +528,9 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
+                # KVTransfer: WAITING reqs have num_computed_tokens > 0
+                # after async KV recvs are completed.
                 else:
-                    # KVTransfer: WAITING reqs have num_computed_tokens > 0
-                    # after async KV recvs are completed.
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
@@ -485,12 +539,12 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
 
+                # KVTransfer: loading remote KV, do not allocate for new work.
                 if load_kv_async:
-                    # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
+                # Number of tokens to be scheduled.
                 else:
-                    # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
@@ -502,7 +556,7 @@ class Scheduler(SchedulerInterface):
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
                     if (
-                        not self.scheduler_config.enable_chunked_prefill
+                        not self.scheduler_config.chunked_prefill_enabled
                         and num_new_tokens > token_budget
                     ):
                         self.waiting.pop_request()
@@ -634,10 +688,11 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert total_num_scheduled_tokens <= active_max_num_scheduled_tokens
 
         assert token_budget >= 0
-        assert len(self.running) <= self.max_num_running_reqs
+        # Validate against the active (possibly overridden) limit.
+        assert len(self.running) <= active_max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
@@ -712,6 +767,12 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+            
+        # [SLO-Tuner] Log active values of overridden parameters: token budget,
+        # max number of running requests, draft width
+
+        logger.debug(f"{active_max_num_scheduled_tokens}, {active_max_num_running_reqs}, {active_num_spec_tokens}")
+        print("Logging: ", active_max_num_scheduled_tokens, active_max_num_running_reqs, active_num_spec_tokens)
         return scheduler_output
 
     def _update_after_schedule(
@@ -783,7 +844,9 @@ class Scheduler(SchedulerInterface):
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
-                all_token_ids[req_id] = req.all_token_ids.copy()
+                all_token_ids[req_id] = req.all_token_ids[
+                    : req.num_computed_tokens + num_tokens
+                ]
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )
@@ -1029,12 +1092,7 @@ class Scheduler(SchedulerInterface):
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens.
-                if request.num_computed_tokens > 0:
-                    request.num_computed_tokens -= num_rejected
-                # If async scheduling, num_output_placeholders also includes
-                # the scheduled spec tokens count and so is similarly adjusted.
-                if request.num_output_placeholders > 0:
-                    request.num_output_placeholders -= num_rejected
+                request.num_computed_tokens -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -1318,6 +1376,90 @@ class Scheduler(SchedulerInterface):
 
     def reset_prefix_cache(self) -> bool:
         return self.kv_cache_manager.reset_prefix_cache()
+
+    # Runtime control API for SLO-Tuner / admin
+    def set_batching(self, max_num_seqs: int | None = None, max_num_batched_tokens: int | None = None) -> None:
+        """Override batching limits for future scheduling steps.
+
+        Args:
+            max_num_seqs: If provided, overrides the maximum number of
+                concurrent sequences (max_num_seqs) used by the scheduler.
+            max_num_batched_tokens: If provided, overrides the maximum
+                number of batched tokens (max_num_batched_tokens) used by
+                the scheduler per scheduling step.
+        """
+        if max_num_seqs is not None:
+            if max_num_seqs < 1:
+                raise ValueError("max_num_seqs must be >= 1")
+            self._runtime_max_num_running_reqs = int(max_num_seqs)
+        else:
+            self._runtime_max_num_running_reqs = None
+
+        if max_num_batched_tokens is not None:
+            if max_num_batched_tokens < 1:
+                raise ValueError("max_num_batched_tokens must be >= 1")
+            self._runtime_max_num_scheduled_tokens = int(max_num_batched_tokens)
+        else:
+            self._runtime_max_num_scheduled_tokens = None
+
+    def get_batching(self) -> tuple[int, int]:
+        """Return the active batching settings (max_num_seqs, max_num_batched_tokens).
+
+        This returns runtime overrides if set, otherwise the configured values.
+        """
+        return (
+            self._runtime_max_num_running_reqs
+            if self._runtime_max_num_running_reqs is not None
+            else self.max_num_running_reqs,
+            self._runtime_max_num_scheduled_tokens
+            if self._runtime_max_num_scheduled_tokens is not None
+            else self.max_num_scheduled_tokens,
+        )
+
+    def set_speculation(self, num_spec_tokens: int | None = None, num_lookahead_tokens: int | None = None) -> None:
+        """Override speculative decoding width for future scheduling steps.
+
+        Args:
+            num_spec_tokens: Number of draft/speculative tokens (draft width).
+            num_lookahead_tokens: Number of lookahead tokens (used by EAGLE).
+        """
+        if num_spec_tokens is not None:
+            if num_spec_tokens < 0:
+                raise ValueError("num_spec_tokens must be >= 0")
+            self._runtime_num_spec_tokens = int(num_spec_tokens)
+        else:
+            self._runtime_num_spec_tokens = None
+
+        if num_lookahead_tokens is not None:
+            if num_lookahead_tokens < 0:
+                raise ValueError("num_lookahead_tokens must be >= 0")
+            self._runtime_num_lookahead_tokens = int(num_lookahead_tokens)
+        else:
+            self._runtime_num_lookahead_tokens = None
+
+    def get_speculation(self) -> tuple[int, int]:
+        """Return the active speculative settings (num_spec_tokens, num_lookahead_tokens).
+
+        Returns runtime overrides if set, otherwise the configured values.
+        """
+        return (
+            self._runtime_num_spec_tokens
+            if self._runtime_num_spec_tokens is not None
+            else self.num_spec_tokens,
+            self._runtime_num_lookahead_tokens
+            if self._runtime_num_lookahead_tokens is not None
+            else self.num_lookahead_tokens,
+        )
+
+    def set_verifier_cadence(self, cadence: int | None) -> None:
+        """Set verifier cadence (verify every `cadence` tokens). None disables override."""
+        if cadence is not None and cadence <= 0:
+            raise ValueError("verifier cadence must be a positive integer or None")
+        self.verifier_cadence = int(cadence) if cadence is not None else None
+
+    def get_verifier_cadence(self) -> int | None:
+        """Return the active verifier cadence or None if not set."""
+        return self.verifier_cadence
 
     def make_stats(
         self,
