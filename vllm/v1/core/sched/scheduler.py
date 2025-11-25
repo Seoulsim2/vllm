@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
+import copy
 
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -47,9 +48,11 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
-# SLO-Tuner imports:
+
+# ------------------------------------------------------------------
+# [SLO-Tuner] Logging Setup
+# ------------------------------------------------------------------
 import logging
-from datetime import datetime
 logging.basicConfig(
     filename="slo_tuner_debug.log",
     level=logging.DEBUG,
@@ -84,6 +87,80 @@ class Scheduler(SchedulerInterface):
         
         # SLO-Tuner: Checking if this is even created
         print(">>> USING MY CUSTOM SCHEDULER <<<")
+
+        # ------------------------------------------------------------------
+        # [SLO-Tuner] Import Parser, Controller, and Config Classes
+        # ------------------------------------------------------------------
+        import sys, os
+        # Point to the root of the project
+        sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../")))
+
+        try:
+            from utils import parser
+            from slo_tuner.simulator import controller
+            from slo_tuner.simulator.controller import Knobs
+            
+            # Import specific classes to build config manually
+            from slo_tuner.config import (
+                AppConfig, KnobBounds, TimingConfig, LengthsConfig, 
+                RegimesConfig, ControllerConfig, SLOConfig, PlotConfig,
+                WorkloadSteady, WorkloadBursty
+            )
+
+            self.slo_parser = parser
+            self.slo_controller = controller
+            print(">>> [SLO-Tuner] Components imported successfully. <<<")
+
+            # Factory function to create the default config structure
+            # mimicking the YAML file structure
+            def create_default_slo_config():
+                return AppConfig(
+                    seed=42,
+                    knobs=KnobBounds(
+                        W_range=(1, 10), 
+                        k_range=(2, 16),
+                        B_range=(1, 256),
+                        W_init=1, k_init=2, B_init=16,
+                        max_wait_ms_range=(0, 200), max_wait_ms_init=0
+                    ),
+                    # Initial timing placeholders (will be overwritten by live metrics)
+                    timing=TimingConfig(
+                        T_pre1=0.0, alpha_pre=0.0, T_dec1=0.0, alpha_dec=0.0,
+                        c_draft=0.0, c_ver=0.0, fidelity="A", decode_noise_sigma=0.05
+                    ),
+                    lengths=LengthsConfig(
+                        prompt_mean=512, prompt_sd=200, output_mean=256, output_sd=50
+                    ),
+                    regimes=RegimesConfig(
+                        steady=WorkloadSteady(lambda_rps=5.0),
+                        bursty=WorkloadBursty(lambda_on_rps=20, T_on_s=2, lambda_off_rps=1, T_off_s=5),
+                        stress_longer_prompts_mult=1.0,
+                        stress_bursty=WorkloadBursty(lambda_on_rps=50, T_on_s=5, lambda_off_rps=1, T_off_s=5)
+                    ),
+                    controller=ControllerConfig(
+                        segment_min_requests=50,
+                        segment_min_seconds=2.0,
+                        delta_improve=0.05,
+                        ema_beta=0.2,
+                        penalty_lambda=20.0
+                    ),
+                    slo=SLOConfig(target_p99_s=1.2), # Your SLO target
+                    outputs_root="/tmp/slo_tuner_logs",
+                    plots=PlotConfig(
+                        dpi=100, figsize_pareto=(6,4), figsize_tracking=(6,4), filepattern=""
+                    )
+                )
+            
+            self.create_slo_config_fn = create_default_slo_config
+
+        except ImportError as e:
+            print(f">>> [SLO-Tuner] CRITICAL: Failed to import Tuner components: {e} <<<")
+            self.slo_parser = None
+            self.slo_controller = None
+            self.create_slo_config_fn = None
+
+        self.slo_step_counter = 0
+        # ------------------------------------------------------------------
         
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -210,6 +287,7 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        # SLO-Tuner: Runtime overrides for scheduling parameters
         # Runtime overrides (None means use configured values)
         # These can be modified at runtime via the setter methods below.
         self._runtime_max_num_running_reqs: int | None = None
@@ -218,6 +296,96 @@ class Scheduler(SchedulerInterface):
         self._runtime_num_lookahead_tokens: int | None = None
         # Verifier cadence: verify every k tokens (None = use default / disabled)
         self.verifier_cadence: int | None = None
+
+        # SLO-Tuner States
+        self.last_tune_time = time.time()
+        self.tune_interval_steps = 10  # Tune every 10 steps
+        
+        # Initialize Tuner Knobs with defaults
+        if self.slo_controller:
+            self.current_knobs = Knobs(
+                W=self.num_spec_tokens, # Start with config value
+                k=self.verifier_cadence if self.verifier_cadence else 1,
+                B=self.max_num_running_reqs,
+                max_wait_ms=0
+            )
+        
+        # Load a base configuration for the simulator
+        # We will override 'timing' in the loop.
+        self.sim_config = None
+        if self.slo_controller and self.create_slo_config_fn:
+            try:
+                self.sim_config = self.create_slo_config_fn()
+                print(">>> [SLO-Tuner] Config created successfully using Factory. <<<")
+            except Exception as e:
+                print(f">>>> [SLO-Tuner] Failed to create config: {e}")
+            
+    # SLO-Tuner: Setter methods for runtime overrides
+    def _run_slo_tuning(self):
+        """
+        Executes the SLO-Tuner Hill Climbing logic using live metrics.
+        """
+        if not self.slo_parser or not self.slo_controller or not self.sim_config:
+            print(">>> [SLO-Tuner] Components not ready, skipping tune.")
+            return
+
+        print(f">>> [SLO-Tuner] Starting Tuning Cycle at step {self.slo_step_counter}...")
+
+        try:
+            # 1. Get Live Metrics & Timing
+            metrics = self.slo_parser.get_metrics_from_api()
+            if not metrics:
+                print(">>> [SLO-Tuner] No metrics available, skipping tune.")
+                return
+                
+            live_timing_config = self.slo_parser.compute_timing_config(metrics)
+            print(f">>> [SLO-Tuner] Live Timing Model: {live_timing_config}")
+
+            # 2. Inject into Simulator Config
+            # We take our base config and inject the live timing
+            tune_cfg = copy.deepcopy(self.sim_config)
+            tune_cfg.timing = live_timing_config
+            
+            # 3. Run Hill Climbing
+            # We use the simulator to find the best next state based on current state
+            print(">>> [SLO-Tuner] Running Hill Climbing Optimization...")
+
+            rows, summary = self.slo_controller.hill_climb(
+                cfg=tune_cfg,
+                regime="steady", # Assuming steady for optimization target
+                steps=1,         # Lookahead steps
+                initial=self.current_knobs # Start from where we are
+            )
+            print(">>> [SLO-Tuner] Hill Climbing Results:")
+            # 4. Apply Results
+            # DEBUG NEW VALUES
+            # best_result = summary[-1] # The final result of the climb
+            new_W = 1
+            new_k = 2
+            new_B = 16
+            # new_W = int(best_result['final_W'])
+            # new_k = int(best_result['final_k'])
+            # new_B = int(best_result['final_B'])
+            
+            
+            print(f">>> [SLO-Tuner] OPTIMIZATION COMPLETE.")
+            print(f"    Old: W={self.current_knobs.W}, B={self.current_knobs.B}")
+            print(f"    New: W={new_W}, B={new_B}, k={new_k}")
+
+            # Update Internal State
+            self.current_knobs.W = new_W
+            self.current_knobs.k = new_k
+            self.current_knobs.B = new_B
+
+            # Apply to vLLM Runtime Overrides
+            self._runtime_num_spec_tokens = new_W
+            self._runtime_max_num_running_reqs = new_B
+            self.verifier_cadence = new_k
+            
+        except Exception as e:
+            print(f">>> [SLO-Tuner] Error during tuning cycle: {e}")
+            import traceback
+            traceback.print_exc()
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -231,7 +399,18 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
-        print(">>> USING MY CUSTOM SCHEDULER schedule() <<<")
+        # ------------------------------------------------------------------
+        # [SLO-Tuner] Tuning Cycle Trigger
+        # ------------------------------------------------------------------
+        self.slo_step_counter += 1
+        if self.slo_step_counter % self.tune_interval_steps == 0:
+            self._run_slo_tuning()
+            
+        # Optional: Print metrics check occasionally
+        if self.slo_parser and self.slo_step_counter % 100 == 0:
+             # Just a liveness check for the API connection
+             pass
+        # ------------------------------------------------------------------
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -240,41 +419,40 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        # Allow runtime overrides for batching/speculation. If a runtime
-        # override is set, use it for this scheduling step. Otherwise fall
-        # back to the configured values.
         
-        # (token budget per scheduling step):
-        active_max_num_scheduled_tokens = (
-            self._runtime_max_num_scheduled_tokens
-            if self._runtime_max_num_scheduled_tokens is not None
-            else self.max_num_scheduled_tokens
-        )
-        # (max number of running requests (Batch size?)):
+        # ------------------------------------------------------------------
+        # [SLO-Tuner] Apply Overrides
+        # ------------------------------------------------------------------
+        
+        # Batch Size (B)
         active_max_num_running_reqs = (
             self._runtime_max_num_running_reqs
             if self._runtime_max_num_running_reqs is not None
             else self.max_num_running_reqs
         )
+        
+        # Token Budget
+        active_max_num_scheduled_tokens = (
+            self._runtime_max_num_scheduled_tokens
+            if self._runtime_max_num_scheduled_tokens is not None
+            else self.max_num_scheduled_tokens
+        )
 
-        # Draft width (speculative decoding):
+        # Draft Width (W)
         active_num_spec_tokens = (
             self._runtime_num_spec_tokens
             if self._runtime_num_spec_tokens is not None
             else self.num_spec_tokens
         )
 
-        # TODO: Find where verifier cadence logic is located
-        # This isn't used
+        # Lookahead (derived from W or explicit override)
         active_num_lookahead = (
             self._runtime_num_lookahead_tokens
             if self._runtime_num_lookahead_tokens is not None
             else self.num_lookahead_tokens
         )
 
-        # Apply speculation overrides for this scheduling step so other
-        # methods (e.g., kv cache allocation) that read these attributes
-        # will see the active values.
+        # Apply speculation overrides to instance state
         self.num_spec_tokens = active_num_spec_tokens
         self.num_lookahead_tokens = active_num_lookahead
 
@@ -304,7 +482,6 @@ class Scheduler(SchedulerInterface):
 
             # Make sure the input position does not exceed the max model len or
             # request's max_tokens.
-            # This is necessary when using spec decoding and/or async scheduling.
             max_total_tokens = min(
                 request.num_prompt_tokens + request.max_tokens, self.max_model_len
             )
@@ -330,18 +507,6 @@ class Scheduler(SchedulerInterface):
                 )
 
             if num_new_tokens == 0:
-                # The request cannot be scheduled because one of the following
-                # reasons:
-                # 1. No new tokens to schedule. This may happen when
-                #    (1) PP>1 and we have already scheduled all prompt tokens
-                #    but they are not finished yet.
-                #    (2) Async scheduling and the request has reached to either
-                #    its max_total_tokens or max_model_len.
-                # 2. The encoder budget is exhausted.
-                # 3. The encoder cache is exhausted.
-                # NOTE(woosuk): Here, by doing `continue` instead of `break`,
-                # we do not strictly follow the FCFS scheduling policy and
-                # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
 
@@ -410,13 +575,10 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens + request.num_computed_tokens - request.num_tokens
                 )
                 if num_scheduled_spec_tokens > 0:
-                    # Trim spec_token_ids list to num_scheduled_spec_tokens.
                     del request.spec_token_ids[num_scheduled_spec_tokens:]
                     scheduled_spec_decode_tokens[request.request_id] = (
                         request.spec_token_ids
                     )
-                # New spec tokens will be set in `update_draft_token_ids` before the
-                # next step when applicable.p
                 request.spec_token_ids = []
 
             # Encoder-related.
@@ -424,7 +586,6 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs[request.request_id] = (
                     encoder_inputs_to_schedule
                 )
-                # Allocate the encoder cache.
                 for i in encoder_inputs_to_schedule:
                     self.encoder_cache_manager.allocate(request, i)
                 encoder_compute_budget = new_encoder_compute_budget
@@ -444,8 +605,6 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Use a temporary RequestQueue to collect requests that need to be
-        # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
@@ -470,8 +629,6 @@ class Scheduler(SchedulerInterface):
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
-                # Skip request if the structured output request is still waiting
-                # for FSM compilation.
                 if request.status == RequestStatus.WAITING_FOR_FSM:
                     structured_output_req = request.structured_output_request
                     if structured_output_req and structured_output_req.grammar:
@@ -481,8 +638,6 @@ class Scheduler(SchedulerInterface):
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
-                # Check that adding the request still respects the max_loras
-                # constraint.
                 if (
                     self.lora_config
                     and request.lora_request
@@ -491,7 +646,6 @@ class Scheduler(SchedulerInterface):
                         and request.lora_request.lora_int_id not in scheduled_loras
                     )
                 ):
-                    # Scheduling would exceed max_loras, skip.
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -499,14 +653,11 @@ class Scheduler(SchedulerInterface):
                 num_external_computed_tokens = 0
                 load_kv_async = False
 
-                # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
-                    # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
 
-                    # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
@@ -515,21 +666,15 @@ class Scheduler(SchedulerInterface):
                         )
 
                         if ext_tokens is None:
-                            # The request cannot be scheduled because
-                            # the KVConnector couldn't determine
-                            # the number of matched tokens.
                             self.waiting.pop_request()
                             skipped_waiting_requests.prepend_request(request)
                             continue
 
                         num_external_computed_tokens = ext_tokens
 
-                    # Total computed tokens (local + external).
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
-                # KVTransfer: WAITING reqs have num_computed_tokens > 0
-                # after async KV recvs are completed.
                 else:
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
@@ -539,22 +684,15 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
 
-                # KVTransfer: loading remote KV, do not allocate for new work.
                 if load_kv_async:
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
-                # Number of tokens to be scheduled.
                 else:
-                    # We use `request.num_tokens` instead of
-                    # `request.num_prompt_tokens` to consider the resumed
-                    # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
-                    # chunked prefill has to be enabled explicitly to allow
-                    # pooling requests to be chunked
                     if (
                         not self.scheduler_config.chunked_prefill_enabled
                         and num_new_tokens > token_budget
@@ -566,7 +704,6 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
-                    # Schedule encoder inputs.
                     if request.has_encoder_inputs:
                         (
                             encoder_inputs_to_schedule,
@@ -580,24 +717,13 @@ class Scheduler(SchedulerInterface):
                             encoder_compute_budget,
                         )
                         if num_new_tokens == 0:
-                            # The request cannot be scheduled.
                             break
 
-                # Handles an edge case when P/D Disaggregation
-                # is used with Spec Decoding where an
-                # extra block gets allocated which
-                # creates a mismatch between the number
-                # of local and remote blocks.
                 effective_lookahead_tokens = (
                     0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
                 )
 
-                # Determine if we need to allocate cross-attention blocks.
                 if self.is_encoder_decoder and request.has_encoder_inputs:
-                    # TODO(russellb): For Whisper, we know that the input is
-                    # always padded to the maximum length. If we support other
-                    # encoder-decoder models, this will need to be updated if we
-                    # want to only allocate what is needed.
                     num_encoder_tokens = (
                         self.scheduler_config.max_num_encoder_input_tokens
                     )
@@ -615,13 +741,8 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
                     break
 
-                # KVTransfer: the connector uses this info to determine
-                # if a load is needed. Note that
-                # This information is used to determine if a load is
-                # needed for this request.
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
@@ -632,12 +753,8 @@ class Scheduler(SchedulerInterface):
                         request, num_external_computed_tokens
                     )
 
-                # Request was already popped from self.waiting
-                # unless it was re-added above due to new_blocks being None.
                 request = self.waiting.pop_request()
                 if load_kv_async:
-                    # If loading async, allocate memory and put request
-                    # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     continue
@@ -664,44 +781,31 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
-                # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request.request_id] = (
                         encoder_inputs_to_schedule
                     )
-                    # Allocate the encoder cache.
                     for i in encoder_inputs_to_schedule:
                         self.encoder_cache_manager.allocate(request, i)
                     encoder_compute_budget = new_encoder_compute_budget
-                # Allocate for external load encoder cache
                 if external_load_encoder_input:
                     for i in external_load_encoder_input:
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
-        # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
-        # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= active_max_num_scheduled_tokens
-
         assert token_budget >= 0
-        # Validate against the active (possibly overridden) limit.
         assert len(self.running) <= active_max_num_running_reqs
-        # Since some requests in the RUNNING queue may not be scheduled in
-        # this step, the total number of scheduled requests can be smaller than
-        # len(self.running).
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
             scheduled_running_reqs
         ) <= len(self.running)
 
-        # Get the longest common prefix among all requests in the running queue.
-        # This can be potentially used for cascade attention.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
             if self.running:
@@ -712,7 +816,6 @@ class Scheduler(SchedulerInterface):
                     )
                 )
 
-        # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(
                 req, req_to_new_blocks[req.request_id].get_block_ids()
@@ -728,7 +831,6 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks,
             )
 
-        # Record the request ids that were scheduled in this step.
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
@@ -740,25 +842,16 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
-            # finished_req_ids is an existing state in the scheduler,
-            # instead of being newly scheduled in this step.
-            # It contains the request IDs that are finished in between
-            # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
         )
 
-        # NOTE(Kuntai): this function is designed for multiple purposes:
-        # 1. Plan the KV cache store
-        # 2. Wrap up all the KV cache load / save ops into an opaque object
-        # 3. Clear the internal states of the connector
         if self.connector is not None:
             meta: KVConnectorMetadata = self.connector.build_connector_meta(
                 scheduler_output
             )
             scheduler_output.kv_connector_metadata = meta
 
-        # Build the connector meta for ECConnector
         if self.ec_connector is not None:
             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
                 scheduler_output
@@ -768,11 +861,12 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
             
-        # [SLO-Tuner] Log active values of overridden parameters: token budget,
-        # max number of running requests, draft width
-
-        logger.debug(f"{active_max_num_scheduled_tokens}, {active_max_num_running_reqs}, {active_num_spec_tokens}")
-        print("Logging: ", active_max_num_scheduled_tokens, active_max_num_running_reqs, active_num_spec_tokens)
+        # [SLO-Tuner] Log active values
+        current_k = self.verifier_cadence if self.verifier_cadence is not None else "Default"
+        
+        logger.debug(f"{active_max_num_scheduled_tokens}, {active_max_num_running_reqs}, {active_num_spec_tokens}, {current_k}")
+        print(f"Logging: Budget={active_max_num_scheduled_tokens}, B={active_max_num_running_reqs}, W={active_num_spec_tokens}, k={current_k}")
+        
         return scheduler_output
 
     def _update_after_schedule(
